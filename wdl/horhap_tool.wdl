@@ -130,7 +130,7 @@ task get_horhaps {
     command <<< 
 
         # download script
-        wget -q https://raw.githubusercontent.com/fedorrik/horhap_tool/refs/heads/main/cluster_alignment_ward.py
+        wget -q https://raw.githubusercontent.com/fedorrik/horhap_tool/refs/heads/main/wdl/cluster_alignment_ward.py
 
         # run script
         python cluster_alignment_ward.py \
