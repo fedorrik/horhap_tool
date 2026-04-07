@@ -4,6 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import sys
+from pathlib import Path
 
 from Bio.SeqIO import parse
 from collections import Counter
@@ -79,9 +80,34 @@ def horhap_size_ratios(clusters):
 
 
 def fcluster_horhaps(linkage_matrix, n_clust):
-    distance_threshold = sorted(linkage_matrix[:, 2], reverse=True)[n_clust - 2] - 0.00001
-    clusters = fcluster(linkage_matrix, t=distance_threshold, criterion="distance")
+    """
+    Return flat clusters targeting n_clust groups.
+
+    Using criterion="distance" with an epsilon below a merge height can overshoot when
+    several merges share the same height. criterion="maxclust" is stable for this use
+    and avoids accidental C19/C20 labels when k=18 was requested.
+    """
+    clusters = fcluster(linkage_matrix, t=n_clust, criterion="maxclust")
     return clusters
+
+
+def prepare_output_paths(output_prefix):
+    output_prefix = Path(output_prefix)
+    parent_dir = output_prefix.parent if str(output_prefix.parent) != '' else Path('.')
+    base_name = output_prefix.name
+
+    out_dirs = {
+        "beds": parent_dir / "horhap_beds",
+        "pngs": parent_dir / "pngs",
+        "fastas": parent_dir / "fastas",
+        "cons": parent_dir / "cons_fa",
+        "divergence": parent_dir / "divergence_tsvs",
+    }
+
+    for d in out_dirs.values():
+        d.mkdir(parents=True, exist_ok=True)
+
+    return base_name, out_dirs
 
 
 def get_hohrhap_divergence_from_pdist(names_subset, name_to_idx, y, verbose):
@@ -164,6 +190,7 @@ def build_link_color_func(linkage_matrix, leaf_cluster_ids, cluster_id_to_color)
 # Plotting
 # ------------------------------------------------------------
 def plot_maps_of_few_k(linkage_matrix, output_prefix, verbose):
+    output_base, out_dirs = prepare_output_paths(output_prefix)
     ks = list(range(2, 21))
     fig, ax = plt.subplots(1, len(ks), figsize=(2 * len(ks), 10))
 
@@ -189,7 +216,7 @@ def plot_maps_of_few_k(linkage_matrix, output_prefix, verbose):
         ax[ax_id].get_yaxis().set_visible(False)
         ax[ax_id].text(0.5, -1, f"k={n_clust}", va="top", ha="center")
 
-    plt.savefig(output_prefix + "_choose_k.png", bbox_inches="tight", dpi=200)
+    plt.savefig(out_dirs["pngs"] / f"{output_base}_choose_k.png", bbox_inches="tight", dpi=200)
     plt.close()
 
 
@@ -228,9 +255,99 @@ def set_y_tick_labels(ax, alignment_list, plot_seq_names=False):
             )
 
 
-def process_and_plot(alignment_list, linkage_matrix, y_full, name_to_idx, n_clust, output_prefix, verbose):
-    consensus = get_consensus(alignment_list)
+def get_dendrogram_leaf_order(linkage_matrix):
+    """
+    Get stable leaf order once. Coloring changes with k, but leaf order does not.
+    """
+    dendr = dendrogram(
+        linkage_matrix,
+        truncate_mode="none",
+        color_threshold=0,
+        above_threshold_color="black",
+        no_labels=True,
+        orientation="left",
+        no_plot=True,
+    )
+    return dendr["leaves"][::-1]
 
+
+def build_mutation_image(alignment_list, hor_names_sorted, verbose):
+    """
+    Render mutation/gap matrix once as an RGB image in fixed dendrogram order.
+    Reuse this image for all k.
+    """
+    consensus = get_consensus(alignment_list)
+    alignment_dict = {i[0]: i[1] for i in alignment_list}
+
+    n_seq = len(hor_names_sorted)
+    len_seq = len(consensus)
+    img = np.ones((n_seq, len_seq, 3), dtype=np.float32)
+
+    nucl_colors_dict_bright = {
+        "A": (0, 1, 0),
+        "T": (1, 0, 0),
+        "G": (0.67, 0, 1),
+        "C": (0, 0, 1),
+        "N": (0, 0, 0),
+        "-": (0.67, 0.67, 0.67),
+    }
+
+    for seq_index in tqdm(range(n_seq), disable=not verbose):
+        hor_name = hor_names_sorted[seq_index]
+        hor_seq = alignment_dict[hor_name]
+
+        for nucl_index in range(len_seq):
+            nucl = hor_seq[nucl_index]
+            if nucl == "-":
+                continue
+            if nucl != consensus[nucl_index]:
+                img[seq_index, nucl_index, :] = nucl_colors_dict_bright.get(nucl, (0, 0, 0))
+
+        for start, end in find_dash_ranges(hor_seq):
+            img[seq_index, start:end + 1, :] = nucl_colors_dict_bright["-"]
+
+    return img, consensus
+
+
+def draw_mutation_panel(ax, mutation_img):
+    n_seq, len_seq = mutation_img.shape[:2]
+    ax.imshow(
+        mutation_img,
+        aspect="auto",
+        interpolation="nearest",
+        origin="upper",
+        extent=(0, len_seq, 0, n_seq),
+    )
+    ax.set_xlim([0, len_seq])
+    ax.set_ylim([0, n_seq])
+    ax.get_yaxis().set_visible(False)
+
+
+def draw_track_panel(ax, hor_names, names_and_group, cluster_id_to_color):
+    n_seq = len(hor_names)
+    one_nucl_height = 1
+    one_nucl_width = 1
+
+    for i, name in enumerate(hor_names):
+        group = names_and_group[name]
+        color = cluster_id_to_color[group]
+        y_position = n_seq - one_nucl_height * (i + 1)
+        ax.add_patch(
+            Rectangle(
+                xy=(0, y_position),
+                width=one_nucl_width,
+                height=one_nucl_height,
+                facecolor=color,
+            )
+        )
+
+    ax.set_ylim([0, n_seq])
+    ax.get_xaxis().set_visible(False)
+
+
+def process_and_plot(alignment_list, linkage_matrix, y_full, name_to_idx, n_clust, output_prefix, verbose,
+                     mutation_img=None, leaf_order_top_to_bottom=None):
+    output_base, out_dirs = prepare_output_paths(output_prefix)
     if verbose:
         print(datetime.now(), "plotting1")
 
@@ -243,9 +360,10 @@ def process_and_plot(alignment_list, linkage_matrix, y_full, name_to_idx, n_clus
 
     clusters_input_order = fcluster_horhaps(linkage_matrix, n_clust)
     cluster_ids_input_order, _ = fcluster_labels_to_cluster_ids(clusters_input_order)
+    actual_n_clust = len(set(cluster_ids_input_order))
 
     names_and_group = {name: cluster_id for name, cluster_id in zip(hor_names, cluster_ids_input_order)}
-    cluster_id_to_color = get_cluster_id_to_color_for_k(n_clust)
+    cluster_id_to_color = get_cluster_id_to_color_for_k(actual_n_clust)
 
     link_color_func = build_link_color_func(
         linkage_matrix=linkage_matrix,
@@ -253,7 +371,7 @@ def process_and_plot(alignment_list, linkage_matrix, y_full, name_to_idx, n_clus
         cluster_id_to_color=cluster_id_to_color,
     )
 
-    dendr = dendrogram(
+    dendrogram(
         linkage_matrix,
         truncate_mode="none",
         color_threshold=0,
@@ -264,82 +382,22 @@ def process_and_plot(alignment_list, linkage_matrix, y_full, name_to_idx, n_clus
         ax=ax[0],
     )
 
-    hor_names_sorted = [hor_names[i] for i in dendr["leaves"]][::-1]
+    if mutation_img is None or leaf_order_top_to_bottom is None:
+        leaf_order_top_to_bottom = get_dendrogram_leaf_order(linkage_matrix)
+        hor_names_sorted = [hor_names[i] for i in leaf_order_top_to_bottom]
+        mutation_img, _ = build_mutation_image(alignment_list, hor_names_sorted, verbose)
 
-    n_seq = len(alignment_dict)
-    len_seq = len(consensus)
-    one_nucl_height = 1
-    one_nucl_width = 1
-
-    nucl_colors_dict_bright = {
-        "A": (0, 1, 0),
-        "T": (1, 0, 0),
-        "G": (0.67, 0, 1),
-        "C": (0, 0, 1),
-        "-": (0.67, 0.67, 0.67),
-    }
-
-    # plot mutations + gaps in dendrogram order
-    for seq_index in tqdm(range(len(hor_names_sorted)), disable=not verbose):
-        hor_name = hor_names_sorted[seq_index]
-        hor_seq = alignment_dict[hor_name]
-        y_position = n_seq - one_nucl_height * (seq_index + 1)
-
-        for nucl_index in range(len_seq):
-            nucl = hor_seq[nucl_index]
-            if nucl != consensus[nucl_index] and nucl != "-":
-                x_position = one_nucl_width * nucl_index
-                color = nucl_colors_dict_bright[nucl]
-                ax[1].add_patch(
-                    Rectangle(
-                        xy=(x_position, y_position),
-                        width=one_nucl_width,
-                        height=one_nucl_height,
-                        facecolor=color,
-                    )
-                )
-
-        color = nucl_colors_dict_bright["-"]
-        for start, end in find_dash_ranges(hor_seq):
-            x_position = start
-            gap_width = end - start + 1
-            ax[1].add_patch(
-                Rectangle(
-                    xy=(x_position, y_position),
-                    width=gap_width,
-                    height=one_nucl_height,
-                    facecolor=color,
-                )
-            )
-
-    ax[1].set_xlim([0, len_seq])
-    ax[1].set_ylim([0, n_seq])
-    ax[1].get_yaxis().set_visible(False)
-
-    # plot map in ORIGINAL input order
-    for i in range(len(hor_names)):
-        name = hor_names[i]
-        group = names_and_group[name]
-        color = cluster_id_to_color[group]
-        y_position = n_seq - one_nucl_height * (i + 1)
-        ax[2].add_patch(
-            Rectangle(
-                xy=(0, y_position),
-                width=one_nucl_width,
-                height=one_nucl_height,
-                facecolor=color,
-            )
-        )
-
-    ax[2].set_ylim([0, n_seq])
-    ax[2].get_xaxis().set_visible(False)
+    draw_mutation_panel(ax[1], mutation_img)
+    draw_track_panel(ax[2], hor_names, names_and_group, cluster_id_to_color)
     set_y_tick_labels(ax[2], alignment_list, plot_seq_names=True)
 
-    plt.savefig(output_prefix + "_clade_plot.png", bbox_inches="tight", dpi=700)
+    png_path = out_dirs["pngs"] / f"{output_base}_clade_plot.png"
+    plt.savefig(png_path, bbox_inches="tight", dpi=700)
     plt.close()
 
     # write bed
-    with open(output_prefix + "_horhap.bed", "w") as f:
+    bed_path = out_dirs["beds"] / f"{output_base}_horhap.bed"
+    with open(bed_path, "w") as f:
         for name in hor_names:
             horhap = names_and_group[name]
             color = cluster_id_to_color[horhap]
@@ -361,7 +419,7 @@ def process_and_plot(alignment_list, linkage_matrix, y_full, name_to_idx, n_clus
     horhap_consensuses = {}
     horhap_divergence_values = {}
 
-    horhaps_uniq = [f"C{i}" for i in range(1, n_clust + 1)]
+    horhaps_uniq = [f"C{i}" for i in range(1, actual_n_clust + 1)]
     for horhap in horhaps_uniq:
         horhap_alignment = []
         for i_hor in hor_names:
@@ -385,15 +443,18 @@ def process_and_plot(alignment_list, linkage_matrix, y_full, name_to_idx, n_clus
             if len(by_stv[stv]) == 1:
                 by_stv[stv].append(by_stv[stv][0])
 
-            with open(f"{output_prefix}_{stv.replace('/', 'h')}::{horhap}.fa", "w") as f:
+            fasta_path = out_dirs["fastas"] / f"{output_base}_{stv.replace('/', 'h')}::{horhap}.fa"
+            with open(fasta_path, "w") as f:
                 for name, seq in by_stv[stv]:
                     f.write(f">{name}\n{seq}\n")
 
-    with open(f"{output_prefix}_cons.fa", "w") as f:
+    cons_path = out_dirs["cons"] / f"{output_base}_cons.fa"
+    with open(cons_path, "w") as f:
         for name in horhap_consensuses:
             f.write(f">{name}\n{horhap_consensuses[name]}\n")
 
-    with open(f"{output_prefix}_divergence.tsv", "w") as f:
+    divergence_path = out_dirs["divergence"] / f"{output_base}_divergence.tsv"
+    with open(divergence_path, "w") as f:
         for name in horhap_divergence_values:
             f.write(f"{name}\t{horhap_divergence_values[name]}\n")
 
@@ -470,13 +531,21 @@ def main():
     # mapping for divergence-from-pdist
     name_to_idx = {name: i for i, name in enumerate(names_saved)}
 
+    # plot mutation matrix once in fixed dendrogram order; reuse for all k
+    if verbose:
+        print(datetime.now(), "precomputing mutation matrix")
+    leaf_order_top_to_bottom = get_dendrogram_leaf_order(linkage_matrix)
+    hor_names = [i[0] for i in alignment_list]
+    hor_names_sorted = [hor_names[i] for i in leaf_order_top_to_bottom]
+    mutation_img, _ = build_mutation_image(alignment_list, hor_names_sorted, verbose)
+
     # plot maps of different k (2..20)
     #plot_maps_of_few_k(linkage_matrix, args.output_prefix, verbose)
 
     # run chosen k mode
     if args.number_of_horhaps:
         n_clust = args.number_of_horhaps
-        process_and_plot(alignment_list, linkage_matrix, y_full, name_to_idx, n_clust, args.output_prefix, verbose)
+        process_and_plot(alignment_list, linkage_matrix, y_full, name_to_idx, n_clust, args.output_prefix, verbose, mutation_img=mutation_img, leaf_order_top_to_bottom=leaf_order_top_to_bottom)
 
     elif args.max_horhap_size:
         n_clust = None
@@ -498,7 +567,7 @@ def main():
         if n_clust is None:
             n_clust = 20
 
-        process_and_plot(alignment_list, linkage_matrix, y_full, name_to_idx, n_clust, args.output_prefix, verbose)
+        process_and_plot(alignment_list, linkage_matrix, y_full, name_to_idx, n_clust, args.output_prefix, verbose, mutation_img=mutation_img, leaf_order_top_to_bottom=leaf_order_top_to_bottom)
 
     else:
         for k in range(2, 21):
@@ -512,6 +581,8 @@ def main():
                 k,
                 f"k{k}_{args.output_prefix}",
                 verbose,
+                mutation_img=mutation_img,
+                leaf_order_top_to_bottom=leaf_order_top_to_bottom,
             )
 
 
