@@ -147,6 +147,84 @@ def get_cluster_id_to_color_for_k(n_clust):
     return {f"C{i + 1}": palette[i] for i in range(n_clust)}
 
 
+def get_sequence_group_from_name(name):
+    """
+    Extract sequence group from the name before coordinates.
+
+    Example:
+    HG02055.mat.cen12_1:27879084-27880441 -> 1
+    """
+    seq_name = name.split("::", 1)[1] if "::" in name else name
+    seq_prefix = seq_name.split(":", 1)[0]
+
+    if "_" in seq_prefix:
+        return seq_prefix.rsplit("_", 1)[1]
+    if "-" in seq_prefix:
+        return seq_prefix.rsplit("-", 1)[1]
+    return "NA"
+
+
+def sort_group_labels(group_labels):
+    def sort_key(group_label):
+        return (0, int(group_label)) if group_label.isdigit() else (1, group_label)
+
+    return sorted(group_labels, key=sort_key)
+
+
+def get_sequence_group_to_color(hor_names):
+    group_labels = sort_group_labels({get_sequence_group_from_name(name) for name in hor_names})
+    cmap = plt.get_cmap("tab10") if len(group_labels) <= 10 else plt.get_cmap("tab20")
+    return {group_label: cmap(i % cmap.N) for i, group_label in enumerate(group_labels)}
+
+
+def read_sequence_group_colors(color_file):
+    group_to_color = {}
+
+    with open(color_file) as f:
+        for line_number, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            fields = line.split()
+            if len(fields) < 2:
+                raise ValueError(f"Bad color line {line_number} in {color_file}: expected group<TAB>r,g,b")
+
+            group = fields[0]
+            rgb_fields = fields[1].split(",")
+            if len(rgb_fields) != 3:
+                raise ValueError(f"Bad RGB on line {line_number} in {color_file}: expected r,g,b")
+
+            try:
+                rgb = tuple(int(value) for value in rgb_fields)
+            except ValueError as exc:
+                raise ValueError(f"Bad RGB on line {line_number} in {color_file}: expected integers") from exc
+
+            if any(value < 0 or value > 255 for value in rgb):
+                raise ValueError(f"Bad RGB on line {line_number} in {color_file}: values must be 0..255")
+
+            group_to_color[group] = tuple(value / 255 for value in rgb)
+
+    if not group_to_color:
+        raise ValueError(f"Empty color file: {color_file}")
+
+    return group_to_color
+
+
+def get_sequence_group_to_color_from_file_or_palette(hor_names, color_file=None):
+    if color_file is None:
+        return None
+
+    group_to_color = read_sequence_group_colors(color_file)
+    missing_groups = sort_group_labels(
+        {get_sequence_group_from_name(name) for name in hor_names if get_sequence_group_from_name(name) not in group_to_color}
+    )
+    if missing_groups:
+        raise ValueError(f"Missing colors for sequence groups in {color_file}: {', '.join(missing_groups)}")
+
+    return group_to_color
+
+
 def fcluster_labels_to_cluster_ids(clusters):
     """
     Map raw fcluster labels to C1..Ck preserving raw fcluster label order:
@@ -345,8 +423,30 @@ def draw_track_panel(ax, hor_names, names_and_group, cluster_id_to_color):
     ax.get_xaxis().set_visible(False)
 
 
+def draw_leaf_tip_group_markers(ax, dendr, hor_names, group_to_color):
+    xlim = ax.get_xlim()
+    marker_width = abs(xlim[0] - xlim[1]) * 0.2
+    marker_height = 10
+
+    for leaf_index, leaf_id in enumerate(dendr["leaves"]):
+        name = hor_names[leaf_id]
+        group = get_sequence_group_from_name(name)
+        y_position = 10 * leaf_index
+        ax.add_patch(
+            Rectangle(
+                xy=(-marker_width, y_position),
+                width=marker_width,
+                height=marker_height,
+                facecolor=group_to_color[group],
+                edgecolor="none",
+                clip_on=False,
+                zorder=10,
+            )
+        )
+
+
 def process_and_plot(alignment_list, linkage_matrix, y_full, name_to_idx, n_clust, output_prefix, verbose,
-                     mutation_img=None, leaf_order_top_to_bottom=None):
+                     mutation_img=None, leaf_order_top_to_bottom=None, sequence_group_colors=None):
     output_base, out_dirs = prepare_output_paths(output_prefix)
     if verbose:
         print(datetime.now(), "plotting1")
@@ -371,7 +471,7 @@ def process_and_plot(alignment_list, linkage_matrix, y_full, name_to_idx, n_clus
         cluster_id_to_color=cluster_id_to_color,
     )
 
-    dendrogram(
+    dendr = dendrogram(
         linkage_matrix,
         truncate_mode="none",
         color_threshold=0,
@@ -381,6 +481,9 @@ def process_and_plot(alignment_list, linkage_matrix, y_full, name_to_idx, n_clus
         orientation="left",
         ax=ax[0],
     )
+    group_to_color = get_sequence_group_to_color_from_file_or_palette(hor_names, sequence_group_colors)
+    if group_to_color is not None:
+        draw_leaf_tip_group_markers(ax[0], dendr, hor_names, group_to_color)
 
     if mutation_img is None or leaf_order_top_to_bottom is None:
         leaf_order_top_to_bottom = get_dendrogram_leaf_order(linkage_matrix)
@@ -501,6 +604,14 @@ def main():
         help="If k not set, choose smallest k where largest horhap < m (fraction). Else do all k=2..20",
     )
 
+    parser.add_argument(
+        "--sequence_group_colors",
+        "--group_colors",
+        type=str,
+        default=None,
+        help="Optional TSV with sequence group colors: group<TAB>r,g,b. Used for the dendrogram leaf-tip track.",
+    )
+
     parser.add_argument("-q", "--quiet", action="store_true", help="Turn off logs (verbosity ON by default)")
 
     args = parser.parse_args()
@@ -545,7 +656,18 @@ def main():
     # run chosen k mode
     if args.number_of_horhaps:
         n_clust = args.number_of_horhaps
-        process_and_plot(alignment_list, linkage_matrix, y_full, name_to_idx, n_clust, args.output_prefix, verbose, mutation_img=mutation_img, leaf_order_top_to_bottom=leaf_order_top_to_bottom)
+        process_and_plot(
+            alignment_list,
+            linkage_matrix,
+            y_full,
+            name_to_idx,
+            n_clust,
+            args.output_prefix,
+            verbose,
+            mutation_img=mutation_img,
+            leaf_order_top_to_bottom=leaf_order_top_to_bottom,
+            sequence_group_colors=args.sequence_group_colors,
+        )
 
     elif args.max_horhap_size:
         n_clust = None
@@ -567,7 +689,18 @@ def main():
         if n_clust is None:
             n_clust = 20
 
-        process_and_plot(alignment_list, linkage_matrix, y_full, name_to_idx, n_clust, args.output_prefix, verbose, mutation_img=mutation_img, leaf_order_top_to_bottom=leaf_order_top_to_bottom)
+        process_and_plot(
+            alignment_list,
+            linkage_matrix,
+            y_full,
+            name_to_idx,
+            n_clust,
+            args.output_prefix,
+            verbose,
+            mutation_img=mutation_img,
+            leaf_order_top_to_bottom=leaf_order_top_to_bottom,
+            sequence_group_colors=args.sequence_group_colors,
+        )
 
     else:
         for k in range(2, 21):
@@ -583,6 +716,7 @@ def main():
                 verbose,
                 mutation_img=mutation_img,
                 leaf_order_top_to_bottom=leaf_order_top_to_bottom,
+                sequence_group_colors=args.sequence_group_colors,
             )
 
 
